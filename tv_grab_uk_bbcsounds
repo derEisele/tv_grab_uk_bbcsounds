@@ -1,0 +1,212 @@
+#!/usr/bin/python3
+
+import requests
+import argparse
+import sys
+import datetime
+import json
+from xml.dom import minidom
+from os.path import expanduser
+
+__VERSION__ = "0.1.0"
+__DESCRIPTION__ = "XMLTV grabber for BBC Sounds (www.bbc.co.uk/sounds)"
+capabilities = ["baseline"]
+
+
+parser = argparse.ArgumentParser(description=__DESCRIPTION__)
+
+# Main
+parser.add_argument("--version", action="store_true")
+parser.add_argument("--capabilities", action="store_true")
+parser.add_argument("--description", action="store_true")
+
+# Baseline
+parser.add_argument("--quiet", action="store_true")
+parser.add_argument("--output", type=str, default="-")
+parser.add_argument("--days", type=int, required=False)
+parser.add_argument("--offset", type=int, default=0)
+parser.add_argument("--config-file", type=str, default="~/.xmltv/tv_grab_uk_bbcsounds.conf")
+
+# manualconfig
+parser.add_argument("--configure", action="store_true")
+
+args = parser.parse_args()
+
+config_file = expanduser(args.config_file)
+
+if args.version:
+    print(__VERSION__)
+    sys.exit(0)
+
+if args.description:
+    print(__DESCRIPTION__)
+    sys.exit(0)
+
+if args.capabilities:
+    for c in capabilities:
+        print(c)
+    sys.exit(0)
+
+
+def get_dates(days, offset):
+    day = datetime.date.today() + datetime.timedelta(days=offset)
+    d = []
+    for _ in range(days):
+        d.append(day.isoformat())
+        day += datetime.timedelta(days=1)
+    return d
+
+
+def to_xmltv_datetime(dt):
+    """
+    Parse python datetime to custom xmltv format
+    :param dt: the datetime
+    :type dt: datetime.datetime
+    :return: The datetime as string
+    :rtype: str
+    """
+    return dt.strftime("%Y%m%d%H%M")
+
+
+def configure_networks():
+    url = "https://rms.api.bbc.co.uk/v2/networks"
+    offset = 0
+    limit = 30
+    total = 1
+    networks = {}
+
+    while offset < total:
+        r = requests.get(url, params={"limit": limit, "offset": offset})
+        if r.status_code != 200:
+            break
+        r = r.json()
+        total = r["total"]
+        offset += limit
+
+        for n in r["data"]:
+            network_info = {
+                "display_name": n["long_title"],
+                "channel_id": n["key"] + ".bbc.co.uk",
+                "service_id": n["default_service_id"],
+                "type": n["type"]
+            }
+            i: str = input("{} ({}) [Ny]".format(network_info["display_name"], network_info["channel_id"]))
+            if i.lower() == "y":
+                networks[n["default_service_id"]] = network_info
+    return networks
+
+
+if args.configure:
+    networks = configure_networks()
+    conf = {"networks": networks}
+    with open(config_file, "w+") as f:
+        json.dump(conf, f)
+    sys.exit()
+
+
+def get_program_for_date(date, root, service):
+    service_id = service["service_id"]
+    channel_id = service["channel_id"]
+    url = "https://rms.api.bbc.co.uk/v2/broadcasts/schedules/" + service_id + "/" + date
+    r = requests.get(url)
+
+    out = []
+
+    if r.status_code != requests.codes.OK:
+        return out
+
+    for bc in r.json()["data"]:
+        title = bc["titles"]["primary"]
+        subtitle = bc["titles"].get("secondary", "")
+        if bc.get("synopses"):
+            description = bc["synopses"].get("long", "") or bc["synopses"].get("medium", "") or bc["synopses"].get("short", "") or ""
+        else:
+            description = ""
+
+        start = datetime.datetime.fromisoformat(bc["start"].replace("Z", "+00:00"))
+        end = datetime.datetime.fromisoformat(bc["end"].replace("Z", "+00:00"))
+
+        programme = root.createElement("programme")
+        programme.setAttribute("channel", channel_id)
+        programme.setAttribute("start", to_xmltv_datetime(start))
+        programme.setAttribute("stop", to_xmltv_datetime(end))
+
+        x_title = root.createElement("title")
+        x_title.appendChild(
+            root.createTextNode(title)
+        )
+        programme.appendChild(x_title)
+
+        x_subtitle = root.createElement("sub-title")
+        x_subtitle.appendChild(
+            root.createTextNode(subtitle)
+        )
+        programme.appendChild(x_subtitle)
+
+        x_desc = root.createElement("desc")
+        x_desc.appendChild(
+            root.createTextNode(description)
+        )
+        programme.appendChild(x_desc)
+
+        out.append(programme)
+
+    return out
+
+
+def generate_channel_xml(root, services):
+    out = []
+
+    for id, service in services.items():
+       channel = root.createElement("channel")
+       channel.setAttribute("id", service["channel_id"])
+       dn = root.createElement("display-name")
+       dn_text = root.createTextNode(service["display_name"])
+       dn.appendChild(dn_text)
+       channel.appendChild(dn)
+       out.append(channel)
+
+    return out
+
+
+def generate_xml(days, services):
+    root = minidom.Document()
+    tv = root.createElement("tv")
+    root.appendChild(tv)
+    channels = generate_channel_xml(root, services)
+    programme = []
+
+    for c in channels:
+        tv.appendChild(c)
+
+    for service in services.values():
+        for d in days:
+            programme.extend(get_program_for_date(d, root, service))
+
+    for p in programme:
+        tv.appendChild(p)
+    return root.toprettyxml()
+
+
+if not args.days:
+    if not args.quiet:
+        print("No amount of days given")
+    sys.exit(-1)
+
+days = get_dates(args.days, args.offset)
+
+try:
+    with open(config_file, "r") as f:
+        config = json.load(f)
+        services = config.get("networks", {})
+        xml = generate_xml(days, services)
+
+        if args.output == "-":
+            print(xml)
+        else:
+            with open(expanduser(args.output), "w+") as of:
+                of.write(xml)
+except FileNotFoundError:
+    sys.exit()
+
+
